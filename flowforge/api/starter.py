@@ -12,6 +12,7 @@ async def main():
         "Temporal",
         id=f"say-hello-workflow-{uuid.uuid4()}",
         task_queue="my-task-queue",
+        result_type=str,
     )
 
     print(f"Workflow result: {result}")

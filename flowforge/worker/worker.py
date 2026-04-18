@@ -4,8 +4,8 @@ from temporalio.worker import Worker
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from ..workflows import SayHelloWorkflow
-    from ..activities import greet
+    from ..workflows.workflows import SayHelloWorkflow
+    from ..activities.activities import greet
 
 
 async def main():
