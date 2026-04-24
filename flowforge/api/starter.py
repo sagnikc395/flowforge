@@ -1,21 +1,36 @@
-# entry point for the execute the workflow
+from __future__ import annotations
 
 import asyncio
 import uuid
+
 from temporalio.client import Client
 
+from flowforge.config import TASK_QUEUE, TEMPORAL_HOST
+from flowforge.api.schemas import OrderRequest
+from flowforge.workflows.workflows import FulfillmentWorkflow
 
-async def main():
-    client = await Client.connect("localhost:7233")
-    result = await client.execute_workflow(
-        "SayHelloWorkflow",
-        "Temporal",
-        id=f"say-hello-workflow-{uuid.uuid4()}",
-        task_queue="my-task-queue",
-        result_type=str,
+
+async def main() -> None:
+    client = await Client.connect(TEMPORAL_HOST)
+    order_id = f"ord_{uuid.uuid4().hex[:12]}"
+    workflow_id = f"order-{order_id}"
+    order = OrderRequest(
+        product_id="SKU-001",
+        quantity=2,
+        customer_id="cust-42",
+        payment_method="tok_visa",
     )
 
-    print(f"Workflow result: {result}")
+    handle = await client.start_workflow(
+        FulfillmentWorkflow.run,
+        args=[order_id, order],
+        id=workflow_id,
+        task_queue=TASK_QUEUE,
+    )
+
+    print(f"Started workflow: {handle.id}")
+    result = await handle.result()
+    print(result.model_dump_json(indent=2))
 
 
 if __name__ == "__main__":
