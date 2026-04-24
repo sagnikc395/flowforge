@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from temporalio import workflow
 
+from flowforge.models import WorkflowState
+
 
 @dataclass
 class CompensationAction:
@@ -19,10 +21,22 @@ class SagaCompensator:
     def add(self, activity_name: str, *args: object) -> None:
         self._actions.append(CompensationAction(activity_name=activity_name, args=args))
 
-    async def compensate(self) -> None:
+    async def compensate(self, state: WorkflowState | None = None) -> None:
         for action in reversed(self._actions):
+            if state is not None:
+                state.record_event(
+                    action.activity_name,
+                    "compensating",
+                    f"Running compensation step {action.activity_name}",
+                )
             await workflow.execute_activity(
                 action.activity_name,
                 args=list(action.args),
                 schedule_to_close_timeout=timedelta(seconds=10),
             )
+            if state is not None:
+                state.record_event(
+                    action.activity_name,
+                    "compensated",
+                    f"Compensation step {action.activity_name} completed",
+                )

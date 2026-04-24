@@ -14,7 +14,12 @@ from flowforge.activities.order import (
     revert_warehouse,
     update_warehouse,
 )
-from flowforge.config import TASK_QUEUE, TEMPORAL_HOST
+from flowforge.config import (
+    MAX_CONCURRENT_ACTIVITIES,
+    MAX_CONCURRENT_WORKFLOW_TASKS,
+    TASK_QUEUE,
+    TEMPORAL_HOST,
+)
 from flowforge.workflows.workflows import FulfillmentWorkflow
 
 
@@ -33,6 +38,8 @@ async def main() -> None:
             update_warehouse,
             revert_warehouse,
         ],
+        max_concurrent_activities=MAX_CONCURRENT_ACTIVITIES,
+        max_concurrent_workflow_tasks=MAX_CONCURRENT_WORKFLOW_TASKS,
     )
     print(f"Worker started on task queue: {TASK_QUEUE}")
     await worker.run()
