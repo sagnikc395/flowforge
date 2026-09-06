@@ -13,8 +13,8 @@ import (
 
 	"github.com/sagnikc395/anchora"
 	"github.com/sagnikc395/anchora/config"
+	"github.com/sagnikc395/anchora/einoagent"
 	"github.com/sagnikc395/anchora/httpapi"
-	"github.com/sagnikc395/anchora/huggingfaceagent"
 	"github.com/sagnikc395/anchora/jobs"
 )
 
@@ -31,7 +31,7 @@ func main() {
 
 	agents := make(httpapi.AgentRegistry, len(cfg.Agents))
 	for name, definition := range cfg.Agents {
-		agent, err := huggingfaceagent.New(ctx, huggingfaceagent.Config{Name: name, ModelID: definition.ModelID, TokenEnv: definition.TokenEnv, Instruction: definition.Instruction, MaxTokens: definition.MaxTokens, Timeout: definition.Timeout()})
+		agent, err := einoagent.New(ctx, einoagent.Config{Name: name, ModelID: definition.ModelID, BaseURL: definition.BaseURL, TokenEnv: definition.TokenEnv, Instruction: definition.Instruction, MaxTokens: definition.MaxTokens, Timeout: definition.Timeout()})
 		if err != nil {
 			log.Fatalf("configure agent %q: %v", name, err)
 		}

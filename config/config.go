@@ -8,10 +8,10 @@ import (
 )
 
 type Config struct {
-	Server   Server                      `yaml:"server"`
-	Workflow Workflow                    `yaml:"workflow"`
-	Async    Async                       `yaml:"async"`
-	Agents   map[string]HuggingFaceAgent `yaml:"agents"`
+	Server   Server           `yaml:"server"`
+	Workflow Workflow         `yaml:"workflow"`
+	Async    Async            `yaml:"async"`
+	Agents   map[string]Agent `yaml:"agents"`
 }
 type Async struct {
 	Enabled        bool   `yaml:"enabled"`
@@ -44,8 +44,9 @@ type Workflow struct {
 	MaxRetries   int `yaml:"max_retries"`
 	RetryDelayMS int `yaml:"retry_delay_ms"`
 }
-type HuggingFaceAgent struct {
+type Agent struct {
 	ModelID     string `yaml:"model_id"`
+	BaseURL     string `yaml:"base_url"`
 	TokenEnv    string `yaml:"token_env"`
 	Instruction string `yaml:"instruction"`
 	MaxTokens   int    `yaml:"max_tokens"`
@@ -154,6 +155,6 @@ func (a Async) WorkerTTL() time.Duration {
 // to true so a single-node deployment recovers without extra configuration.
 func (a Async) ReaperEnabled() bool          { return a.Reaper == nil || *a.Reaper }
 func (w Workflow) RetryDelay() time.Duration { return time.Duration(w.RetryDelayMS) * time.Millisecond }
-func (a HuggingFaceAgent) Timeout() time.Duration {
+func (a Agent) Timeout() time.Duration {
 	return time.Duration(a.TimeoutMS) * time.Millisecond
 }

@@ -58,17 +58,16 @@ A claimed job is not removed from Redis. It moves into a lease set scored by a
 deadline and tagged with the claiming worker, and PostgreSQL records the same
 ownership on the job row. The owner renews both on a heartbeat; a worker that
 dies stops renewing, and a reaper on any node returns the job to the ready
-list. Because deliveries are therefore at-least-once, three things keep a
-retry cheap and safe:
+list.
 
-- **Fenced writes.** Every write a worker makes while running a job is
-  conditional on it still holding the PostgreSQL lease, so a partitioned worker
-  that has already been replaced cannot overwrite the new owner's progress.
-- **Resume.** A redelivered job replays the steps that already succeeded from
-  the store instead of calling their agents again, so recovering from a crash
-  costs only the work that was actually lost.
-- **Dead-lettering.** A job that keeps coming back is failed permanently after
-  `async.max_attempts` deliveries rather than looping forever.
+Deliveries are therefore at-least-once, and a redelivery is cheap. Writes are
+fenced: everything a worker writes while running a job is conditional on it
+still holding the PostgreSQL lease, so a partitioned worker that has already
+been replaced cannot overwrite the new owner's progress. A redelivered job
+resumes instead of restarting, replaying the steps that already succeeded from
+the store rather than calling their agents again, so recovering from a crash
+costs only the work that was actually lost. And a job that keeps coming back is
+dead-lettered after `async.max_attempts` deliveries instead of looping forever.
 
 ```mermaid
 flowchart LR
@@ -112,8 +111,8 @@ flowchart LR
 
 Two reapers cover each other. The Redis sweep handles the ordinary case of a
 worker dying. The PostgreSQL sweep handles jobs whose queue entry vanished
-entirely — a Redis flush or a failover — and re-enqueues them; it waits one
-extra lease period so the cheaper sweep goes first.
+entirely (a Redis flush or a failover) and re-enqueues them; it waits one extra
+lease period so the cheaper sweep goes first.
 
 ## Running it
 
@@ -169,15 +168,14 @@ database and Redis queue; run as many nodes as you like. Each worker registers
 itself in `workflow_workers` and heartbeats, so `GET /v1/cluster` shows the
 live roster and the queue depth.
 
-Startup now fails fast if `async.enabled` is set without both backend URLs, and
+Startup fails fast if `async.enabled` is set without both backend URLs, and
 `SIGINT`/`SIGTERM` drains in-flight jobs: a worker shutting down releases its
 claim and requeues the job, so a rolling restart does not wait out the full
 visibility timeout.
 
-The durability of the queue is the durability of Redis. The included compose
-file enables append-only persistence with per-second fsync and gives both
-services a named volume; the PostgreSQL-side reaper covers whatever a Redis
-restart still loses.
+Queue durability depends on Redis. The included compose file enables
+append-only persistence with per-second fsync and gives both services a named
+volume; the PostgreSQL-side reaper covers whatever a Redis restart still loses.
 
 Submit and inspect a job:
 
@@ -305,9 +303,9 @@ task fmt
 ```
 
 Unit tests cover the workflow engine (including resume), the synchronous
-router, the Hugging Face transport, configuration, and the worker lifecycle —
-claim, resume, duplicate delivery, lease loss, shutdown requeue, dead-lettering,
-and reaping — against in-memory fakes, so they need no services.
+router, the Eino model adapter, configuration, and the worker lifecycle
+(claim, resume, duplicate delivery, lease loss, shutdown requeue,
+dead-lettering, and reaping) against in-memory fakes, so they need no services.
 
 The Lua scripts and SQL are covered separately by tests that need real servers.
 They skip unless both URLs are set:
@@ -329,7 +327,7 @@ httpapi/router.go          HTTP routes and SSE polling
 jobs/jobs.go               submission, worker lifecycle, reaper
 jobs/store.go              PostgreSQL schema, leases, worker registry
 jobs/queue.go              Redis queue: atomic claim, lease, reclaim
-huggingfaceagent/agent.go  Hugging Face adapter
+einoagent/agent.go        Eino OpenAI-compatible model adapter (Hugging Face by default)
 config/config.go           YAML and environment configuration
 cmd/anchora/main.go        executable entrypoint
 ```
