@@ -6,7 +6,8 @@ are ready at the same time, and makes successful outputs available to later
 steps.
 
 It is a Go service with an HTTP API. Workflows can run in the request that
-started them, or they can be submitted as jobs backed by PostgreSQL and Redis.
+started them, or they can be submitted as jobs backed by PostgreSQL and Redis
+and executed by a pool of workers that survives losing any of its nodes.
 There is no UI, authentication, scheduler, or model abstraction beyond the
 small `Agent` interface in this repository.
 
@@ -49,9 +50,25 @@ the job store (`pending`, `running`, `succeeded`, `failed`, and `skipped`).
 
 The synchronous endpoint calls the workflow engine directly. The job endpoint
 stores a validated job, places its ID on a Redis list, and returns. A worker
-takes the ID from Redis, runs the same workflow engine, writes step and job
+claims the ID from Redis, runs the same workflow engine, writes step and job
 updates to PostgreSQL, and records events. The events endpoint polls those
 stored events and exposes them as Server-Sent Events.
+
+A claimed job is not removed from Redis. It moves into a lease set scored by a
+deadline and tagged with the claiming worker, and PostgreSQL records the same
+ownership on the job row. The owner renews both on a heartbeat; a worker that
+dies stops renewing, and a reaper on any node returns the job to the ready
+list. Because deliveries are therefore at-least-once, three things keep a
+retry cheap and safe:
+
+- **Fenced writes.** Every write a worker makes while running a job is
+  conditional on it still holding the PostgreSQL lease, so a partitioned worker
+  that has already been replaced cannot overwrite the new owner's progress.
+- **Resume.** A redelivered job replays the steps that already succeeded from
+  the store instead of calling their agents again, so recovering from a crash
+  costs only the work that was actually lost.
+- **Dead-lettering.** A job that keeps coming back is failed permanently after
+  `async.max_attempts` deliveries rather than looping forever.
 
 ```mermaid
 flowchart LR
@@ -66,10 +83,11 @@ flowchart LR
 
     Engine[Workflow engine\nvalidate DAG, render prompts, run ready steps]
     HF[Hugging Face agent\nchat completions]
-    DB[(PostgreSQL\njobs, steps, events)]
+    DB[(PostgreSQL\njobs, steps, events, workers\nowner + lease per job)]
     Ready[(Redis ready list)]
-    Processing[(Redis processing list)]
-    Worker[Worker goroutine]
+    Leases[(Redis lease set\njob to deadline + owner)]
+    Worker[Worker\nclaim, heartbeat, run]
+    Reaper[Reaper\nsweep expired leases]
     HFRouter[router.huggingface.co]
 
     Client --> Sync
@@ -80,14 +98,22 @@ flowchart LR
     Submit --> DB
     Submit --> Ready
     Ready --> Worker
-    Worker --> Processing
+    Worker -- claim + renew --> Leases
+    Worker -- claim + renew --> DB
     Worker --> Engine
-    Worker --> DB
+    Reaper -- expired --> Leases
+    Reaper -- requeue --> Ready
+    Reaper -- orphans --> DB
     Client --> Get
     Get --> DB
     Client --> Events
     Events --> DB
 ```
+
+Two reapers cover each other. The Redis sweep handles the ordinary case of a
+worker dying. The PostgreSQL sweep handles jobs whose queue entry vanished
+entirely — a Redis flush or a failover — and re-enqueues them; it waits one
+extra lease period so the cheaper sweep goes first.
 
 ## Running it
 
@@ -136,10 +162,22 @@ export HF_TOKEN=hf_replace_me
 go run ./cmd/anchora -config config.yaml
 ```
 
-With async mode enabled, Anchora creates its three tables on startup and starts
-the configured number of worker goroutines (`workers: 0` is treated as one).
-Jobs are shared by processes using the same PostgreSQL database and Redis
-queue.
+With async mode enabled, Anchora creates its tables on startup and starts the
+configured number of worker goroutines (`workers: 0` is treated as one) plus a
+reaper. Jobs are shared by every process pointed at the same PostgreSQL
+database and Redis queue; run as many nodes as you like. Each worker registers
+itself in `workflow_workers` and heartbeats, so `GET /v1/cluster` shows the
+live roster and the queue depth.
+
+Startup now fails fast if `async.enabled` is set without both backend URLs, and
+`SIGINT`/`SIGTERM` drains in-flight jobs: a worker shutting down releases its
+claim and requeues the job, so a rolling restart does not wait out the full
+visibility timeout.
+
+The durability of the queue is the durability of Redis. The included compose
+file enables append-only persistence with per-second fsync and gives both
+services a named volume; the PostgreSQL-side reaper covers whatever a Redis
+restart still loses.
 
 Submit and inspect a job:
 
@@ -153,11 +191,35 @@ curl -N -H 'Last-Event-ID: 0' \
   http://localhost:8080/v1/jobs/<job-id>/events
 ```
 
-The current events endpoint requires a parseable `Last-Event-ID` header,
-including on the first request. It polls PostgreSQL every 500 ms and emits
-`job.queued`, `job.running`, `step.completed`, `job.completed`, or
-`job.failed` events as they are recorded. A job moved into Redis's processing
-list is not requeued automatically if its worker stops.
+`Last-Event-ID` is optional; send it to resume a dropped stream from the last
+event you saw. The endpoint polls PostgreSQL every 500 ms and emits
+`job.queued`, `job.running`, `job.resumed`, `step.completed`, `job.reclaimed`,
+`job.abandoned`, `job.dead_lettered`, and `job.completed` events as they are
+recorded, then closes once the job reaches a terminal state.
+
+Inspect the cluster:
+
+```sh
+curl http://localhost:8080/v1/cluster
+```
+
+```json
+{
+  "queue_ready": 0,
+  "queue_in_flight": 1,
+  "workers": [
+    {
+      "id": "node-a-4711-1f2e3d4c",
+      "hostname": "node-a",
+      "pid": 4711,
+      "queue": "anchora:jobs",
+      "started_at": "2026-09-06T12:00:00Z",
+      "last_heartbeat_at": "2026-09-06T12:04:58Z",
+      "jobs_claimed": 12
+    }
+  ]
+}
+```
 
 ## HTTP API
 
@@ -170,7 +232,8 @@ limited to 1 MiB and unknown JSON fields are rejected.
 | POST | `/v1/workflows/run` | Always | `200` with step results; `502` when a workflow step fails; `400` for invalid input; `500` for other errors |
 | POST | `/v1/jobs` | Async mode | `202` with the created job; `400` for invalid input |
 | GET | `/v1/jobs/{id}` | Async mode | `200` with the job, `404` if it does not exist, or `500` on a store error |
-| GET | `/v1/jobs/{id}/events` | Async mode | `200` SSE, `404` if it does not exist, `400` for an invalid `Last-Event-ID`, or `500` if streaming is unsupported |
+| GET | `/v1/jobs/{id}/events` | Async mode | `200` SSE, `404` if it does not exist, `400` for an unparseable `Last-Event-ID`, or `500` if streaming is unsupported |
+| GET | `/v1/cluster` | Async mode | `200` with queue depth and the live worker roster, or `500` on a backend error |
 
 Unknown agent names and invalid workflow graphs are reported as `400`.
 
@@ -204,6 +267,13 @@ async:
   redis_url_env: REDIS_URL
   queue_name: anchora:jobs
   workers: 2
+  lease_ms: 30000
+  heartbeat_ms: 0
+  max_attempts: 3
+  reaper_interval_ms: 5000
+  worker_ttl_ms: 0
+  reclaim_batch: 100
+  reaper: true
 agents: {}
 ```
 
@@ -214,27 +284,51 @@ agents: {}
 underlying HTTP client without a timeout, and `max_tokens` of zero omits that
 field from the provider request.
 
+The distributed settings tune recovery:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `lease_ms` | `30000` | Visibility timeout. A claimed job is handed to another worker if its owner stops heartbeating for this long. Set it above your slowest step's latency, or a healthy but slow job will be taken away mid-run. |
+| `heartbeat_ms` | a third of `lease_ms` | Lease renewal interval. Must be shorter than `lease_ms`; startup rejects it otherwise. |
+| `max_attempts` | `3` | Deliveries before a job is dead-lettered. `0` means unlimited. |
+| `reaper_interval_ms` | `5000` | How often expired leases are swept and dead workers pruned. |
+| `worker_ttl_ms` | four leases | How long a silent worker stays in the registry. |
+| `reclaim_batch` | `100` | Jobs recovered per sweep. |
+| `reaper` | `true` | Whether this node runs the sweep. Safe to leave on everywhere; the sweeps are atomic. |
+
 ## Development
 
 ```sh
-go test ./...
-task test
-task check
+task test          # go test -race ./...
+task check         # format check plus tests
 task fmt
 ```
 
-The tests cover the workflow engine, the synchronous router, and the Hugging
-Face transport with mocks. PostgreSQL/Redis storage and queue behavior are not
-covered by integration tests in this repository.
+Unit tests cover the workflow engine (including resume), the synchronous
+router, the Hugging Face transport, configuration, and the worker lifecycle —
+claim, resume, duplicate delivery, lease loss, shutdown requeue, dead-lettering,
+and reaping — against in-memory fakes, so they need no services.
+
+The Lua scripts and SQL are covered separately by tests that need real servers.
+They skip unless both URLs are set:
+
+```sh
+task test-integration
+
+# or, against your own instances (the Redis database given is written to):
+ANCHORA_TEST_DATABASE_URL='postgres://anchora:anchora@localhost:5432/anchora?sslmode=disable' \
+ANCHORA_TEST_REDIS_URL='redis://localhost:6379/1' \
+  go test -race -count=1 -run Integration ./jobs/
+```
 
 ## Repository map
 
 ```text
 workflow.go                DAG validation and execution
 httpapi/router.go          HTTP routes and SSE polling
-jobs/jobs.go               job submission and workers
-jobs/store.go              PostgreSQL schema and persistence
-jobs/queue.go              Redis ready/processing lists
+jobs/jobs.go               submission, worker lifecycle, reaper
+jobs/store.go              PostgreSQL schema, leases, worker registry
+jobs/queue.go              Redis queue: atomic claim, lease, reclaim
 huggingfaceagent/agent.go  Hugging Face adapter
 config/config.go           YAML and environment configuration
 cmd/anchora/main.go        executable entrypoint

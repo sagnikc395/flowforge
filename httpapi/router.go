@@ -10,6 +10,7 @@ import (
 	"github.com/sagnikc395/anchora"
 	"github.com/sagnikc395/anchora/jobs"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -42,6 +43,7 @@ func NewRouterWithJobs(agents AgentResolver, options Options, service *jobs.Serv
 		r.Post("/v1/jobs", submitJobHandler(service))
 		r.Get("/v1/jobs/{id}", getJobHandler(service))
 		r.Get("/v1/jobs/{id}/events", eventsHandler(service))
+		r.Get("/v1/cluster", clusterHandler(service))
 	}
 	return r
 }
@@ -150,10 +152,17 @@ func eventsHandler(service *jobs.Service) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "streaming unsupported")
 			return
 		}
+		// Last-Event-ID is absent on a first connection and carries the last
+		// delivered event ID on a reconnect; only a present-but-unparseable
+		// value is an error.
 		var after int64
-		if _, err := fmt.Sscan(r.Header.Get("Last-Event-ID"), &after); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid Last-Event-ID")
-			return
+		if resume := r.Header.Get("Last-Event-ID"); resume != "" {
+			parsed, err := strconv.ParseInt(resume, 10, 64)
+			if err != nil || parsed < 0 {
+				writeError(w, http.StatusBadRequest, "invalid Last-Event-ID")
+				return
+			}
+			after = parsed
 		}
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
@@ -162,11 +171,18 @@ func eventsHandler(service *jobs.Service) http.HandlerFunc {
 			if err != nil {
 				return
 			}
+			terminal := false
 			for _, event := range events {
 				_, _ = fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", event.ID, event.Type, event.Data)
 				after = event.ID
+				if event.Type == "job.completed" || event.Type == "job.dead_lettered" {
+					terminal = true
+				}
 			}
 			flusher.Flush()
+			if terminal {
+				return
+			}
 			select {
 			case <-r.Context().Done():
 				return
@@ -175,6 +191,20 @@ func eventsHandler(service *jobs.Service) http.HandlerFunc {
 		}
 	}
 }
+
+// clusterHandler reports queue depth and the live worker roster, which is how
+// an operator confirms that workers are heartbeating and work is draining.
+func clusterHandler(service *jobs.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		stats, err := service.Stats(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, stats)
+	}
+}
+
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }

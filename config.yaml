@@ -14,6 +14,24 @@ async:
   queue_name: anchora:jobs
   workers: 2
 
+  # Visibility timeout. A claimed job is handed to another worker if its owner
+  # stops heartbeating for this long, which is how a crashed node's work is
+  # recovered. Raise it above your slowest expected job's step latency.
+  lease_ms: 30000
+  # Lease renewal interval. Must be well under lease_ms; 0 uses a third of it.
+  heartbeat_ms: 0
+  # Deliveries allowed before a job is dead-lettered. 0 means unlimited.
+  max_attempts: 3
+  # How often expired leases are swept and dead workers pruned.
+  reaper_interval_ms: 5000
+  # How long a silent worker stays in the registry. 0 uses four leases.
+  worker_ttl_ms: 0
+  # Jobs recovered per sweep.
+  reclaim_batch: 100
+  # Run the recovery sweep on this node. Safe to leave on everywhere; the
+  # sweeps are atomic. Set false only if you run a dedicated reaper process.
+  reaper: true
+
 # Named Hugging Face agents are optional. Set HF_TOKEN (or each agent's
 # token_env) before starting the server.
 agents: {}

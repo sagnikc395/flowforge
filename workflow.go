@@ -44,6 +44,10 @@ type Options struct {
 	MaxRetries  int
 	RetryDelay  time.Duration
 	OnStepState func(StepResult)
+	// Resume seeds results for steps that already finished in an earlier
+	// attempt. Succeeded steps are not re-executed, which makes redelivery of
+	// a partially completed job cheap and side-effect free.
+	Resume []StepResult
 }
 type Workflow struct {
 	steps   []Step
@@ -96,6 +100,16 @@ func (w *Workflow) Run(ctx context.Context) ([]StepResult, error) {
 		remaining[step.ID] = step
 	}
 	results := make(map[string]StepResult, len(w.steps))
+	for _, prior := range w.options.Resume {
+		if prior.Status != Succeeded {
+			continue
+		}
+		if _, ok := remaining[prior.ID]; !ok {
+			continue
+		}
+		results[prior.ID] = prior
+		delete(remaining, prior.ID)
+	}
 	for len(remaining) > 0 {
 		ready := make([]Step, 0)
 		for id, step := range remaining {
