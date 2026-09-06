@@ -8,8 +8,9 @@ steps.
 It is a Go service with an HTTP API. Workflows can run in the request that
 started them, or they can be submitted as jobs backed by PostgreSQL and Redis
 and executed by a pool of workers that survives losing any of its nodes.
-There is no UI, authentication, scheduler, or model abstraction beyond the
-small `Agent` interface in this repository.
+There is no UI, authentication, or scheduler. Agents are the one abstraction:
+a small `Agent` interface in this repository, wired by the executable to an
+Eino chat model that speaks to any OpenAI-compatible provider.
 
 ## A workflow
 
@@ -81,13 +82,13 @@ flowchart LR
     end
 
     Engine[Workflow engine\nvalidate DAG, render prompts, run ready steps]
-    HF[Hugging Face agent\nchat completions]
+    HF[Eino chat model adapter\nOpenAI-compatible provider]
     DB[(PostgreSQL\njobs, steps, events, workers\nowner + lease per job)]
     Ready[(Redis ready list)]
     Leases[(Redis lease set\njob to deadline + owner)]
     Worker[Worker\nclaim, heartbeat, run]
     Reaper[Reaper\nsweep expired leases]
-    HFRouter[router.huggingface.co]
+    HFRouter[Provider endpoint\nrouter.huggingface.co by default]
 
     Client --> Sync
     Sync --> Engine
@@ -117,7 +118,8 @@ lease period so the cheaper sweep goes first.
 ## Running it
 
 Requirements: Go 1.25 or newer. Docker is only needed for the optional
-PostgreSQL and Redis services. Real requests also need a Hugging Face token.
+PostgreSQL and Redis services. Real requests also need an API token for the
+provider you point an agent at; Hugging Face's router is the default.
 
 The checked-in `config.yaml` starts the synchronous API and has no agents
 configured. Add at least one named agent before sending a workflow:
@@ -126,11 +128,15 @@ configured. Add at least one named agent before sending a workflow:
 agents:
   research:
     model_id: HuggingFaceTB/SmolLM3-3B:fastest
+    base_url: https://router.huggingface.co/v1
     token_env: HF_TOKEN
     instruction: You are a concise research assistant.
     max_tokens: 1024
     timeout_ms: 30000
 ```
+
+`base_url` is optional and defaults to Hugging Face's router. Point it at any
+other OpenAI-compatible endpoint, with `token_env` naming that provider's key.
 
 Then set the token and start the server:
 
@@ -245,11 +251,14 @@ type Agent interface {
 }
 ```
 
-The executable currently wires named agents to the Hugging Face Inference
-Providers endpoint at `https://router.huggingface.co/v1/chat/completions`.
-Each request contains the configured system instruction, when present, and
-the rendered prompt as a user message. `model_id`, `max_tokens`, and the bearer
-token are taken from configuration and the configured environment variable.
+The executable wires named agents to an [Eino](https://github.com/cloudwego/eino)
+OpenAI-compatible chat model. `base_url` defaults to Hugging Face's Inference
+Providers router (`https://router.huggingface.co/v1`), so requests land on
+`/chat/completions` there unless configured otherwise. Each generation sends the
+configured system instruction, when present, followed by the rendered prompt as
+a user message, and fails if the model returns no text. `model_id`,
+`max_tokens`, `timeout_ms`, and the bearer token come from configuration and
+the named environment variable.
 
 ## Configuration
 
@@ -275,12 +284,13 @@ async:
 agents: {}
 ```
 
-`server.address` defaults to `:8080`. Retry values and agent
-`max_tokens`/`timeout_ms` must be non-negative. `token_env` defaults to
-`HF_TOKEN`; database and Redis environment-variable names default to
-`DATABASE_URL` and `REDIS_URL`. An agent's `timeout_ms` of zero leaves the
-underlying HTTP client without a timeout, and `max_tokens` of zero omits that
-field from the provider request.
+`server.address` defaults to `:8080`. Retry values, worker counts, and agent
+`max_tokens`/`timeout_ms` must be non-negative. Every agent needs a `model_id`.
+`token_env` defaults to `HF_TOKEN` and `base_url` to
+`https://router.huggingface.co/v1`; database and Redis environment-variable
+names default to `DATABASE_URL` and `REDIS_URL`. An agent's `timeout_ms` of zero
+leaves the model's HTTP client without a timeout, and `max_tokens` of zero omits
+that field from the provider request.
 
 The distributed settings tune recovery:
 
@@ -297,9 +307,13 @@ The distributed settings tune recovery:
 ## Development
 
 ```sh
+task run           # go run ./cmd/anchora -config config.yaml (override with CONFIG=)
 task test          # go test -race ./...
 task check         # format check plus tests
 task fmt
+task services-up   # docker compose up -d (PostgreSQL and Redis)
+task services-down
+task services-logs
 ```
 
 Unit tests cover the workflow engine (including resume), the synchronous
@@ -308,7 +322,8 @@ router, the Eino model adapter, configuration, and the worker lifecycle
 dead-lettering, and reaping) against in-memory fakes, so they need no services.
 
 The Lua scripts and SQL are covered separately by tests that need real servers.
-They skip unless both URLs are set:
+They skip unless both URLs are set; `task test-integration` starts the compose
+services and sets them for you:
 
 ```sh
 task test-integration
@@ -327,7 +342,7 @@ httpapi/router.go          HTTP routes and SSE polling
 jobs/jobs.go               submission, worker lifecycle, reaper
 jobs/store.go              PostgreSQL schema, leases, worker registry
 jobs/queue.go              Redis queue: atomic claim, lease, reclaim
-einoagent/agent.go        Eino OpenAI-compatible model adapter (Hugging Face by default)
+einoagent/agent.go         Eino OpenAI-compatible model adapter (Hugging Face by default)
 config/config.go           YAML and environment configuration
 cmd/anchora/main.go        executable entrypoint
 ```
