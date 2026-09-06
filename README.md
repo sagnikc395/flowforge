@@ -75,10 +75,10 @@ flowchart LR
     Client[Client]
 
     subgraph HTTP[Anchora HTTP API]
-        Sync[POST /v1/workflows/run]
-        Submit[POST /v1/jobs]
-        Get[GET /v1/jobs/{id}]
-        Events[GET /v1/jobs/{id}/events]
+        Sync["POST /v1/workflows/run"]
+        Submit["POST /v1/jobs"]
+        Get["GET /v1/jobs/{id}"]
+        Events["GET /v1/jobs/{id}/events"]
     end
 
     Engine[Workflow engine\nvalidate DAG, render prompts, run ready steps]
